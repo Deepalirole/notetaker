@@ -397,12 +397,22 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
 
   if (msg.type === "MEETING_JOINED") {
     // Content script detected the user is actually in the call — start recording.
-    const senderTabId = _sender.tab?.id;
-    if (senderTabId != null && activeSessions.has(senderTabId)) {
-      console.log("[Notetaker] Join signal from tab", senderTabId, "— starting recording.");
-      beginRecordingForTab(senderTabId).catch((e) =>
-        console.warn("[Notetaker] beginRecordingForTab failed:", e)
-      );
+    const senderTab = _sender.tab;
+    const senderTabId = senderTab?.id;
+    if (senderTabId != null) {
+      (async () => {
+        // The MV3 service worker may have been terminated during the lobby wait,
+        // wiping the in-memory activeSessions map. If so, recreate the session
+        // now — otherwise recording would silently never start.
+        if (!activeSessions.has(senderTabId)) {
+          console.log("[Notetaker] Join with no active session — recreating (service worker restarted).");
+          await onMeetingStarted(senderTabId, senderTab?.url ?? "");
+        }
+        if (activeSessions.has(senderTabId)) {
+          console.log("[Notetaker] Join signal from tab", senderTabId, "— starting recording.");
+          await beginRecordingForTab(senderTabId);
+        }
+      })().catch((e) => console.warn("[Notetaker] join handling failed:", e));
     }
     sendResponse({ ok: true });
   }
@@ -410,9 +420,23 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
   if (msg.type === "MEETING_LEFT" || msg.type === "MEETING_ENDED_EARLY") {
     // Content script detected the user left the call — stop and process.
     const senderTabId = _sender.tab?.id;
-    if (senderTabId != null && activeSessions.has(senderTabId)) {
-      console.log("[Notetaker] Leave signal from tab", senderTabId, "— ending meeting.");
-      onMeetingEnded(senderTabId);
+    if (senderTabId != null) {
+      (async () => {
+        // If the service worker restarted mid-call, restore the session from
+        // storage so the recording still gets stopped + finalized.
+        if (!activeSessions.has(senderTabId)) {
+          const stored = await chrome.storage.session.get([`session_${senderTabId}`]);
+          const s = stored[`session_${senderTabId}`] as MeetingSession | undefined;
+          if (s?.sessionId) {
+            activeSessions.set(senderTabId, s);
+            console.log("[Notetaker] Restored session from storage for leave (service worker restarted).");
+          }
+        }
+        if (activeSessions.has(senderTabId)) {
+          console.log("[Notetaker] Leave signal from tab", senderTabId, "— ending meeting.");
+          await onMeetingEnded(senderTabId);
+        }
+      })().catch((e) => console.warn("[Notetaker] leave handling failed:", e));
     }
     sendResponse({ ok: true });
   }
