@@ -260,37 +260,80 @@ function startObserving(): void {
   tryAttach();
 }
 
-// ── Detect actual join / leave via the in-call "Leave call" control ──────────
-// Recording must track the REAL call, not the pre-join lobby. The hang-up /
-// "Leave call" button only exists while you are actually in the call, so its
-// presence is the most reliable in-call signal across Meet DOM versions.
+// ── Detect actual join / leave (record the REAL call, not the lobby) ─────────
+// A single button selector proved too brittle across Meet DOM versions, so this
+// combines several independent signals:
+//   1. URL must be a meeting-code path (xxx-xxxx-xxx).
+//   2. Lobby / waiting-room / post-call affordances (Join now, Ask to join,
+//      Asking to join, Rejoin, Return to home screen) mean NOT in-call.
+//   3. A positive in-call signal (hang-up control) confirms in-call; if none of
+//      the negative affordances are present on a meeting URL, we treat that as
+//      in-call too (covers versions where the hang-up selector doesn't match).
 let inCall = false;
 let absenceStreak = 0;
 let callWatchStarted = false;
-const LEAVE_DEBOUNCE = 3; // consecutive absent polls (~4.5s) before declaring "left"
+let lastHeartbeat = 0;
+const LEAVE_DEBOUNCE = 3; // consecutive "not in call" polls (~4.5s) before leaving
 
-function findLeaveButton(): Element | null {
+const NOT_IN_CALL_TEXTS = [
+  "join now", "ask to join", "asking to join", "switch here",
+  "rejoin", "return to home screen", "you left the meeting", "you left the call",
+];
+
+function isMeetingCodeUrl(): boolean {
+  // Meet codes look like abc-defg-hij; the landing page has no such path.
+  return /\/[a-z]{3}-[a-z]{4}-[a-z]{3}\b/i.test(location.pathname);
+}
+
+function hasAnyText(labels: string[]): boolean {
+  // Only clickable elements / headings — cheap, and where these labels live.
+  const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, h1, h2, h3'));
+  return nodes.some((n) => {
+    const t = (n.textContent || "").trim().toLowerCase();
+    return t.length <= 40 && labels.includes(t);
+  });
+}
+
+function findHangup(): Element | null {
   return (
-    document.querySelector('button[aria-label="Leave call" i]') ||
-    document.querySelector('[aria-label="Leave call" i]') ||
-    document.querySelector('button[aria-label*="leave call" i]') ||
-    document.querySelector('button[aria-label*="leave the call" i]') ||
-    document.querySelector('[data-tooltip*="Leave call" i]') ||
-    document.querySelector('[jsname="CQylad"]') // legacy hang-up jsname (best-effort)
+    document.querySelector('[aria-label*="leave call" i]') ||
+    document.querySelector('[aria-label*="leave the call" i]') ||
+    document.querySelector('[aria-label*="leave meeting" i]') ||
+    document.querySelector('[jsname="CQylad"]')
   );
+}
+
+function isInCall(): boolean {
+  if (!isMeetingCodeUrl()) return false;
+  if (hasAnyText(NOT_IN_CALL_TEXTS)) return false; // lobby / waiting / post-call
+  if (findHangup()) return true;                   // positive confirmation
+  // On a meeting URL with no lobby/post-call affordance and controls loaded,
+  // treat as in-call (handles DOM versions our hang-up selector misses).
+  return true;
 }
 
 function watchCallState(): void {
   if (callWatchStarted) return;
   callWatchStarted = true;
+  console.log("[Notetaker] Watching call state on", location.href);
 
   const interval = setInterval(() => {
-    const present = !!findLeaveButton();
+    const present = isInCall();
+
+    // Heartbeat every ~9s so we can diagnose detection from the page console.
+    const now = Date.now();
+    if (now - lastHeartbeat > 9000) {
+      lastHeartbeat = now;
+      console.log(
+        `[Notetaker] state: inCall=${inCall} detected=${present} ` +
+        `meetingUrl=${isMeetingCodeUrl()} hangup=${!!findHangup()} ` +
+        `lobbyText=${hasAnyText(NOT_IN_CALL_TEXTS)}`
+      );
+    }
 
     if (present) {
       absenceStreak = 0;
       if (!inCall) {
-        // false → true: user just joined the actual call.
         inCall = true;
         meetingStartTime = Date.now();
         segments = [];
@@ -300,10 +343,8 @@ function watchCallState(): void {
         chrome.runtime.sendMessage({ type: "MEETING_JOINED" } as ExtMessage).catch(() => {});
       }
     } else if (inCall) {
-      // Controls can auto-hide briefly — require a few consecutive misses.
       absenceStreak++;
       if (absenceStreak >= LEAVE_DEBOUNCE) {
-        // true → false: user left the call.
         inCall = false;
         absenceStreak = 0;
         console.log("[Notetaker] Left call — stop recording.");
