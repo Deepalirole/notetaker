@@ -28,6 +28,28 @@ let sessionId: string | null = null;
 let backendUrl = "http://localhost:8000";
 let audioMime = "audio/webm";
 
+// Live media resources — MUST be released when recording ends, otherwise the mic
+// and tab-audio capture stay held, which breaks audio in the next meeting and
+// prevents new captures from starting.
+let capturedStreams: MediaStream[] = [];
+let audioContext: AudioContext | null = null;
+
+// Stop every captured track and close the mixing AudioContext. Safe to call twice.
+function releaseDevices(): void {
+  for (const stream of capturedStreams) {
+    try {
+      stream.getTracks().forEach((t) => t.stop());
+    } catch (_) { /* ignore */ }
+  }
+  capturedStreams = [];
+  if (audioContext) {
+    try {
+      audioContext.close();
+    } catch (_) { /* ignore */ }
+    audioContext = null;
+  }
+}
+
 // Per-kind upload bookkeeping.
 const pipelines: Record<StreamKind, PipelineState> = {
   audio: { index: 0, queue: Promise.resolve() },
@@ -57,7 +79,9 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
       if (audioRecorder && audioRecorder.state !== "inactive") {
         stopRecording(); // audio onstop fires → waits for queues → RECORDING_COMPLETE
       } else {
-        // No active recorder (e.g. getUserMedia failed) — signal immediately
+        // No active recorder (e.g. getUserMedia failed) — release any held
+        // devices and signal immediately.
+        releaseDevices();
         chrome.runtime.sendMessage({
           type: "RECORDING_COMPLETE",
           payload: { tabId: currentTabId, sessionId, mimeType: "audio/webm", audioData: null },
@@ -121,6 +145,8 @@ async function startRecording({
     stopRecording();
     await new Promise((r) => setTimeout(r, 200));
   }
+  // Defensive: release any devices still held from a previous meeting.
+  releaseDevices();
 
   currentTabId = tabId;
   sessionId = incomingSessionId || `session_${tabId}_${Date.now()}`;
@@ -149,11 +175,13 @@ async function startRecording({
     console.warn("[Notetaker offscreen] Tab video capture unavailable, audio only:", _videoErr);
     tabStream = await getTabStream(streamId, false);
   }
+  capturedStreams.push(tabStream);
 
   // 3. Microphone (optional).
   let micStream: MediaStream | null = null;
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    capturedStreams.push(micStream);
   } catch (_) {
     // Mic unavailable — tab audio only, which is fine.
   }
@@ -161,10 +189,10 @@ async function startRecording({
   // 4. Audio stream for transcription: tab audio + mic mixed at 16 kHz (Whisper's rate).
   let audioStream: MediaStream = tabStream;
   try {
-    const ctx = new AudioContext({ sampleRate: 16000 });
-    const dest = ctx.createMediaStreamDestination();
-    ctx.createMediaStreamSource(new MediaStream(tabStream.getAudioTracks())).connect(dest);
-    if (micStream) ctx.createMediaStreamSource(micStream).connect(dest);
+    audioContext = new AudioContext({ sampleRate: 16000 });
+    const dest = audioContext.createMediaStreamDestination();
+    audioContext.createMediaStreamSource(new MediaStream(tabStream.getAudioTracks())).connect(dest);
+    if (micStream) audioContext.createMediaStreamSource(micStream).connect(dest);
     audioStream = dest.stream;
   } catch (_) {
     // Fall back to the raw tab stream's audio.
@@ -180,6 +208,7 @@ async function startRecording({
   audioRecorder.onerror = (e) => {
     console.error("[Notetaker offscreen] Audio MediaRecorder error:", e);
     isRecording = false;
+    releaseDevices();
     chrome.runtime.sendMessage({
       type: "RECORDING_FAILED",
       payload: { tabId: currentTabId, error: "MediaRecorder error" },
@@ -219,6 +248,10 @@ async function startRecording({
 
 function onAudioStop(): void {
   isRecording = false;
+  // Release the mic + tab capture NOW. Final data blobs are already captured and
+  // the upload queue holds them independently, so freeing the live tracks here
+  // is what lets the NEXT meeting capture audio cleanly.
+  releaseDevices();
   // Wait for BOTH upload queues to drain before notifying background so the
   // backend has the full recording ready to finalize.
   Promise.all([pipelines.audio.queue, pipelines.video.queue])
